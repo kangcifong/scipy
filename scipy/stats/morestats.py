@@ -98,7 +98,7 @@ def bayes_mvs(data, alpha=0.90):
     >>> mean
     Mean(statistic=9.0, minmax=(7.1036502226125329, 10.896349777387467))
     >>> var
-    Variance(statistic=10.0, minmax=(3.1767242068607087, 24.459103821334018))
+    Variance(statistic=10.0, minmax=(3.176724206..., 24.45910382...))
     >>> std
     Std_dev(statistic=2.9724954732045084, minmax=(1.7823367265645143, 4.9456146050146295))
 
@@ -610,7 +610,7 @@ def probplot(x, sparams=(), dist='norm', fit=True, plot=None, rvalue=False):
 
     if plot is not None:
         plot.plot(osm, osr, 'bo', osm, slope*osm + intercept, 'r-')
-        _add_axis_labels_title(plot, xlabel='Quantiles',
+        _add_axis_labels_title(plot, xlabel='Theoretical quantiles',
                                ylabel='Ordered Values',
                                title='Probability Plot')
 
@@ -1368,9 +1368,10 @@ def anderson(x, dist='norm'):
     ----------
     x : array_like
         array of sample data
-    dist : {'norm','expon','logistic','gumbel','extreme1'}, optional
+    dist : {'norm','expon','logistic','gumbel','gumbel_l', gumbel_r',
+        'extreme1'}, optional
         the type of distribution to test against.  The default is 'norm'
-        and 'extreme1' is a synonym for 'gumbel'
+        and 'extreme1', 'gumbel_l' and 'gumbel' are synonyms.
 
     Returns
     -------
@@ -1418,7 +1419,8 @@ def anderson(x, dist='norm'):
            pp. 591-595.
 
     """
-    if dist not in ['norm', 'expon', 'gumbel', 'extreme1', 'logistic']:
+    if dist not in ['norm', 'expon', 'gumbel', 'gumbel_l',
+                    'gumbel_r', 'extreme1', 'logistic']:
         raise ValueError("Invalid distribution; dist must be 'norm', "
                          "'expon', 'gumbel', 'extreme1' or 'logistic'.")
     y = sort(x)
@@ -1427,12 +1429,14 @@ def anderson(x, dist='norm'):
     if dist == 'norm':
         s = np.std(x, ddof=1, axis=0)
         w = (y - xbar) / s
-        z = distributions.norm.cdf(w)
+        logcdf = distributions.norm.logcdf(w)
+        logsf = distributions.norm.logsf(w)
         sig = array([15, 10, 5, 2.5, 1])
         critical = around(_Avals_norm / (1.0 + 4.0/N - 25.0/N/N), 3)
     elif dist == 'expon':
         w = y / xbar
-        z = distributions.expon.cdf(w)
+        logcdf = distributions.expon.logcdf(w)
+        logsf = distributions.expon.logsf(w)
         sig = array([15, 10, 5, 2.5, 1])
         critical = around(_Avals_expon / (1.0 + 0.6/N), 3)
     elif dist == 'logistic':
@@ -1447,18 +1451,27 @@ def anderson(x, dist='norm'):
         sol0 = array([xbar, np.std(x, ddof=1, axis=0)])
         sol = optimize.fsolve(rootfunc, sol0, args=(x, N), xtol=1e-5)
         w = (y - sol[0]) / sol[1]
-        z = distributions.logistic.cdf(w)
+        logcdf = distributions.logistic.logcdf(w)
+        logsf = distributions.logistic.logsf(w)
         sig = array([25, 10, 5, 2.5, 1, 0.5])
         critical = around(_Avals_logistic / (1.0 + 0.25/N), 3)
-    else:  # (dist == 'gumbel') or (dist == 'extreme1'):
+    elif dist == 'gumbel_r':
+        xbar, s = distributions.gumbel_r.fit(x)
+        w = (y - xbar) / s
+        logcdf = distributions.gumbel_r.logcdf(w)
+        logsf = distributions.gumbel_r.logsf(w)
+        sig = array([25, 10, 5, 2.5, 1])
+        critical = around(_Avals_gumbel / (1.0 + 0.2/sqrt(N)), 3)
+    else:  # (dist == 'gumbel') or (dist == 'gumbel_l') or (dist == 'extreme1')
         xbar, s = distributions.gumbel_l.fit(x)
         w = (y - xbar) / s
-        z = distributions.gumbel_l.cdf(w)
+        logcdf = distributions.gumbel_l.logcdf(w)
+        logsf = distributions.gumbel_l.logsf(w)
         sig = array([25, 10, 5, 2.5, 1])
         critical = around(_Avals_gumbel / (1.0 + 0.2/sqrt(N)), 3)
 
     i = arange(1, N + 1)
-    A2 = -N - np.sum((2*i - 1.0) / N * (log(z) + log(1 - z[::-1])), axis=0)
+    A2 = -N - np.sum((2*i - 1.0) / N * (logcdf + logsf[::-1]), axis=0)
 
     return AndersonResult(A2, critical, sig)
 
@@ -2372,7 +2385,7 @@ def wilcoxon(x, y=None, zero_method="wilcox", correction=False):
                          "or 'pratt' or 'zsplit'")
 
     if y is None:
-        d = x
+        d = asarray(x)
     else:
         x, y = map(asarray, (x, y))
         if len(x) != len(y):
@@ -2386,6 +2399,7 @@ def wilcoxon(x, y=None, zero_method="wilcox", correction=False):
     count = len(d)
     if count < 10:
         warnings.warn("Warning: sample size too small for normal approximation.")
+
     r = stats.rankdata(abs(d))
     r_plus = np.sum((d > 0) * r, axis=0)
     r_minus = np.sum((d < 0) * r, axis=0)
@@ -2702,7 +2716,7 @@ def circmean(samples, high=2*pi, low=0, axis=None):
     mask = (S == .0) * (C == .0)
     if mask.ndim > 0:
         res[mask] = np.nan
-    return res 
+    return res
 
 def circvar(samples, high=2*pi, low=0, axis=None):
     """

@@ -1,8 +1,11 @@
 from __future__ import division, print_function, absolute_import
 
+import sys
+
 from decimal import Decimal
 from itertools import product
 
+from nose import SkipTest
 from numpy.testing import (
     TestCase, run_module_suite, assert_equal,
     assert_almost_equal, assert_array_equal, assert_array_almost_equal,
@@ -14,10 +17,15 @@ from scipy.optimize import fmin
 from scipy import signal
 from scipy.signal import (
     correlate, convolve, convolve2d, fftconvolve, hann,
-    hilbert, hilbert2, lfilter, lfilter_zi, filtfilt, butter, tf2zpk,
-    invres, invresz, vectorstrength, signaltools, lfiltic, tf2sos, sosfilt,
-    sosfilt_zi)
+    hilbert, hilbert2, lfilter, lfilter_zi, filtfilt, butter, zpk2tf, zpk2sos,
+    invres, invresz, vectorstrength, lfiltic, tf2sos, sosfilt, sosfiltfilt,
+    sosfilt_zi, tf2zpk)
 from scipy.signal.signaltools import _filtfilt_gust
+
+if sys.version_info.major >= 3 and sys.version_info.minor >= 5:
+    from math import gcd
+else:
+    from fractions import gcd
 
 
 class _TestConvolve(TestCase):
@@ -390,104 +398,6 @@ class TestFFTConvolve(TestCase):
             d = np.convolve(a, b, 'full')
             assert_allclose(c, d, atol=1e-10, err_msg=msg)
 
-    def test_next_regular(self):
-        np.random.seed(1234)
-
-        def ns():
-            for j in range(1, 1000):
-                yield j
-            yield 2**5 * 3**5 * 4**5 + 1
-
-        for n in ns():
-            m = signaltools._next_regular(n)
-            msg = "n=%d, m=%d" % (n, m)
-
-            assert_(m >= n, msg)
-
-            # check regularity
-            k = m
-            for d in [2, 3, 5]:
-                while True:
-                    a, b = divmod(k, d)
-                    if b == 0:
-                        k = a
-                    else:
-                        break
-            assert_equal(k, 1, err_msg=msg)
-
-    def test_next_regular_strict(self):
-        hams = {
-            1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 8, 8: 8, 14: 15, 15: 15,
-            16: 16, 17: 18, 1021: 1024, 1536: 1536, 51200000: 51200000,
-            510183360: 510183360, 510183360 + 1: 512000000,
-            511000000: 512000000,
-            854296875: 854296875, 854296875 + 1: 859963392,
-            196608000000: 196608000000, 196608000000 + 1: 196830000000,
-            8789062500000: 8789062500000, 8789062500000 + 1: 8796093022208,
-            206391214080000: 206391214080000,
-            206391214080000 + 1: 206624260800000,
-            470184984576000: 470184984576000,
-            470184984576000 + 1: 470715894135000,
-            7222041363087360: 7222041363087360,
-            7222041363087360 + 1: 7230196133913600,
-            # power of 5    5**23
-            11920928955078125: 11920928955078125,
-            11920928955078125 - 1: 11920928955078125,
-            # power of 3    3**34
-            16677181699666569: 16677181699666569,
-            16677181699666569 - 1: 16677181699666569,
-            # power of 2   2**54
-            18014398509481984: 18014398509481984,
-            18014398509481984 - 1: 18014398509481984,
-            # above this, int(ceil(n)) == int(ceil(n+1))
-            19200000000000000: 19200000000000000,
-            19200000000000000 + 1: 19221679687500000,
-            288230376151711744: 288230376151711744,
-            288230376151711744 + 1: 288325195312500000,
-            288325195312500000 - 1: 288325195312500000,
-            288325195312500000: 288325195312500000,
-            288325195312500000 + 1: 288555831593533440,
-            # power of 3    3**83
-            3990838394187339929534246675572349035227 - 1:
-                3990838394187339929534246675572349035227,
-            3990838394187339929534246675572349035227:
-                3990838394187339929534246675572349035227,
-            # power of 2     2**135
-            43556142965880123323311949751266331066368 - 1:
-                43556142965880123323311949751266331066368,
-            43556142965880123323311949751266331066368:
-                43556142965880123323311949751266331066368,
-            # power of 5      5**57
-            6938893903907228377647697925567626953125 - 1:
-                6938893903907228377647697925567626953125,
-            6938893903907228377647697925567626953125:
-                6938893903907228377647697925567626953125,
-            # http://www.drdobbs.com/228700538
-            # 2**96 * 3**1 * 5**13
-            290142196707511001929482240000000000000 - 1:
-                290142196707511001929482240000000000000,
-            290142196707511001929482240000000000000:
-                290142196707511001929482240000000000000,
-            290142196707511001929482240000000000000 + 1:
-                290237644800000000000000000000000000000,
-            # 2**36 * 3**69 * 5**7
-            4479571262811807241115438439905203543080960000000 - 1:
-                4479571262811807241115438439905203543080960000000,
-            4479571262811807241115438439905203543080960000000:
-                4479571262811807241115438439905203543080960000000,
-            4479571262811807241115438439905203543080960000000 + 1:
-                4480327901140333639941336854183943340032000000000,
-            # 2**37 * 3**44 * 5**42
-            30774090693237851027531250000000000000000000000000000000000000 - 1:
-                30774090693237851027531250000000000000000000000000000000000000,
-            30774090693237851027531250000000000000000000000000000000000000:
-                30774090693237851027531250000000000000000000000000000000000000,
-            30774090693237851027531250000000000000000000000000000000000000 + 1:
-                30778180617309082445871527002041377406962596539492679680000000,
-        }
-        for x, y in hams.items():
-            assert_equal(signaltools._next_regular(x), y)
-
     def test_invalid_shapes(self):
         # By "invalid," we mean that no one
         # array has dimensions that are all at
@@ -583,7 +493,11 @@ class TestResample(TestCase):
         # Test polyphase resampling
         self._test_data(method='polyphase')
 
-    def _test_data(self, method):
+    def test_polyphase_extfilter(self):
+        # Test external specification of downsampling filter
+        self._test_data(method='polyphase', ext=True)
+
+    def _test_data(self, method, ext=False):
         # Test resampling of sinusoids and random noise (1-sec)
         rate = 100
         rates_to = [49, 50, 51, 99, 100, 101, 199, 200, 201]
@@ -599,7 +513,23 @@ class TestResample(TestCase):
             if method == 'fft':
                 y_resamps = signal.resample(x, rate_to, axis=-1)
             else:
-                y_resamps = signal.resample_poly(x, rate_to, rate, axis=-1)
+                if ext and rate_to != rate:
+                    # Match default window design
+                    g = gcd(rate_to, rate)
+                    up = rate_to // g
+                    down = rate // g
+                    max_rate = max(up, down)
+                    f_c = 1. / max_rate
+                    half_len = 10 * max_rate
+                    window = signal.firwin(2 * half_len + 1, f_c,
+                                           window=('kaiser', 5.0))
+                    polyargs = {'window': window}
+                else:
+                    polyargs = {}
+
+                y_resamps = signal.resample_poly(x, rate_to, rate, axis=-1,
+                                                 **polyargs)
+
             for y_to, y_resamp, freq in zip(y_tos, y_resamps, freqs):
                 if freq >= 0.5 * rate_to:
                     y_to.fill(0.)  # mostly low-passed away
@@ -607,7 +537,7 @@ class TestResample(TestCase):
                 else:
                     assert_array_equal(y_to.shape, y_resamp.shape)
                     corr = np.corrcoef(y_to, y_resamp)[0, 1]
-                    assert_(corr > 0.99, msg=corr)
+                    assert_(corr > 0.99, msg=(corr, rate, rate_to))
 
         # Random data
         rng = np.random.RandomState(0)
@@ -623,6 +553,34 @@ class TestResample(TestCase):
             assert_array_equal(y_to.shape, y_resamp.shape)
             corr = np.corrcoef(y_to, y_resamp)[0, 1]
             assert_(corr > 0.99, msg=corr)
+
+    def test_poly_vs_filtfilt(self):
+        # Check that up=1.0 gives same answer as filtfilt + slicing
+        random_state = np.random.RandomState(17)
+        try_types = (int, np.float32, np.complex64, float, complex)
+        size = 10000
+        down_factors = [2, 11, 79]
+
+        for dtype in try_types:
+            x = random_state.randn(size).astype(dtype)
+            if dtype in (np.complex64, np.complex128):
+                x += 1j * random_state.randn(size)
+
+            # resample_poly assumes zeros outside of signl, wheras filtfilt
+            # can only constant-pad. Make them equivalent:
+            x[0] = 0
+            x[-1] = 0
+
+            for down in down_factors:
+                h = signal.firwin(31, 1. / down, window='hamming')
+                yf = filtfilt(h, 1.0, x, padtype='constant')[::down]
+
+                # Need to pass convolved version of filter to resample_poly,
+                # since filtfilt does forward and backward, but resample_poly
+                # only goes forward
+                hc = convolve(h, h[::-1])
+                y = signal.resample_poly(x, 1, down, window=hc)
+                assert_allclose(yf, y, atol=1e-7, rtol=1e-7)
 
 
 class TestCSpline1DEval(TestCase):
@@ -1324,10 +1282,21 @@ class TestLFilterZI(TestCase):
 
 
 class TestFiltFilt(TestCase):
+    filtfilt_kind = 'tf'
+
+    def filtfilt(self, zpk, x, axis=-1, padtype='odd', padlen=None,
+                 method='pad', irlen=None):
+        if self.filtfilt_kind == 'tf':
+            b, a = zpk2tf(*zpk)
+            return filtfilt(b, a, x, axis, padtype, padlen, method, irlen)
+        elif self.filtfilt_kind == 'sos':
+            sos = zpk2sos(*zpk)
+            return sosfiltfilt(sos, x, axis, padtype, padlen)
 
     def test_basic(self):
-        out = signal.filtfilt([1, 2, 3], [1, 2, 3], np.arange(12))
-        assert_equal(out, arange(12))
+        zpk = tf2zpk([1, 2, 3], [1, 2, 3])
+        out = self.filtfilt(zpk, np.arange(12))
+        assert_allclose(out, arange(12), atol=1e-14)
 
     def test_sine(self):
         rate = 2000
@@ -1337,49 +1306,52 @@ class TestFiltFilt(TestCase):
         xhigh = np.sin(250 * 2 * np.pi * t)
         x = xlow + xhigh
 
-        b, a = butter(8, 0.125)
-        z, p, k = tf2zpk(b, a)
+        zpk = butter(8, 0.125, output='zpk')
         # r is the magnitude of the largest pole.
-        r = np.abs(p).max()
+        r = np.abs(zpk[1]).max()
         eps = 1e-5
         # n estimates the number of steps for the
         # transient to decay by a factor of eps.
         n = int(np.ceil(np.log(eps) / np.log(r)))
 
         # High order lowpass filter...
-        y = filtfilt(b, a, x, padlen=n)
+        y = self.filtfilt(zpk, x, padlen=n)
         # Result should be just xlow.
         err = np.abs(y - xlow).max()
         assert_(err < 1e-4)
 
         # A 2D case.
         x2d = np.vstack([xlow, xlow + xhigh])
-        y2d = filtfilt(b, a, x2d, padlen=n, axis=1)
+        y2d = self.filtfilt(zpk, x2d, padlen=n, axis=1)
         assert_equal(y2d.shape, x2d.shape)
         err = np.abs(y2d - xlow).max()
         assert_(err < 1e-4)
 
         # Use the previous result to check the use of the axis keyword.
         # (Regression test for ticket #1620)
-        y2dt = filtfilt(b, a, x2d.T, padlen=n, axis=0)
+        y2dt = self.filtfilt(zpk, x2d.T, padlen=n, axis=0)
         assert_equal(y2d, y2dt.T)
 
     def test_axis(self):
         # Test the 'axis' keyword on a 3D array.
         x = np.arange(10.0 * 11.0 * 12.0).reshape(10, 11, 12)
-        b, a = butter(3, 0.125)
-        y0 = filtfilt(b, a, x, padlen=0, axis=0)
-        y1 = filtfilt(b, a, np.swapaxes(x, 0, 1), padlen=0, axis=1)
+        zpk = butter(3, 0.125, output='zpk')
+        y0 = self.filtfilt(zpk, x, padlen=0, axis=0)
+        y1 = self.filtfilt(zpk, np.swapaxes(x, 0, 1), padlen=0, axis=1)
         assert_array_equal(y0, np.swapaxes(y1, 0, 1))
-        y2 = filtfilt(b, a, np.swapaxes(x, 0, 2), padlen=0, axis=2)
+        y2 = self.filtfilt(zpk, np.swapaxes(x, 0, 2), padlen=0, axis=2)
         assert_array_equal(y0, np.swapaxes(y2, 0, 2))
 
     def test_acoeff(self):
+        if self.filtfilt_kind != 'tf':
+            return  # only necessary for TF
         # test for 'a' coefficient as single number
         out = signal.filtfilt([.5, .5], 1, np.arange(10))
         assert_allclose(out, np.arange(10), rtol=1e-14, atol=1e-14)
 
     def test_gust_simple(self):
+        if self.filtfilt_kind != 'tf':
+            raise SkipTest('gust only implemented for TF systems')
         # The input array has length 2.  The exact solution for this case
         # was computed "by hand".
         x = np.array([1.0, 2.0])
@@ -1392,6 +1364,8 @@ class TestFiltFilt(TestCase):
                             0.25*z1[0] + z2[0] + 0.125*x[0] + 0.25*x[1]])
 
     def test_gust_scalars(self):
+        if self.filtfilt_kind != 'tf':
+            raise SkipTest('gust only implemented for TF systems')
         # The filter coefficients are both scalars, so the filter simply
         # multiplies its input by b/a.  When it is used in filtfilt, the
         # factor is (b/a)**2.
@@ -1401,6 +1375,21 @@ class TestFiltFilt(TestCase):
         y = filtfilt(b, a, x, method="gust")
         expected = (b/a)**2 * x
         assert_allclose(y, expected)
+
+
+class TestSOSFiltFilt(TestFiltFilt):
+    filtfilt_kind = 'sos'
+
+    def test_equivalence(self):
+        """Test equivalence between sosfiltfilt and filtfilt"""
+        x = np.random.RandomState(0).randn(1000)
+        for order in range(1, 6):
+            zpk = signal.butter(order, 0.35, output='zpk')
+            b, a = zpk2tf(*zpk)
+            sos = zpk2sos(*zpk)
+            y = filtfilt(b, a, x)
+            y_sos = sosfiltfilt(sos, x)
+            assert_allclose(y, y_sos, atol=1e-12, err_msg='order=%s' % order)
 
 
 def filtfilt_gust_opt(b, a, x):
@@ -1481,16 +1470,16 @@ def check_filtfilt_gust(b, a, shape, axis, irlen=None):
 
 def test_filtfilt_gust():
     # Design a filter.
-    b, a = signal.ellip(3, 0.01, 120, 0.0875)
+    z, p, k = signal.ellip(3, 0.01, 120, 0.0875, output='zpk')
 
     # Find the approximate impulse response length of the filter.
-    z, p, k = tf2zpk(b, a)
     eps = 1e-10
     r = np.max(np.abs(p))
     approx_impulse_len = int(np.ceil(np.log(eps) / np.log(r)))
 
     np.random.seed(123)
 
+    b, a = zpk2tf(z, p, k)
     for irlen in [None, approx_impulse_len]:
         signal_len = 5 * approx_impulse_len
 
@@ -1537,6 +1526,9 @@ class TestDecimate(TestCase):
     def test_phaseshift_FIR(self):
         self._test_phaseshift(method='fir', zero_phase=False)
 
+    def test_zero_phase_FIR(self):
+        self._test_phaseshift(method='fir', zero_phase=True)
+
     def test_phaseshift_IIR(self):
         self._test_phaseshift(method='iir', zero_phase=False)
 
@@ -1564,12 +1556,12 @@ class TestDecimate(TestCase):
             # Set up downsampling filters, match v0.17 defaults
             if method == 'fir':
                 n = 30
-                system = signal.lti(signal.firwin(n + 1, 1. / q,
-                                                  window='hamming'), 1.)
+                system = signal.dlti(signal.firwin(n + 1, 1. / q,
+                                                   window='hamming'), 1.)
             elif method == 'iir':
                 n = 8
                 wc = 0.8*np.pi/q
-                system = signal.lti(*signal.cheby1(n, 0.05, wc/np.pi))
+                system = signal.dlti(*signal.cheby1(n, 0.05, wc/np.pi))
 
             # Calculate expected phase response, as unit complex vector
             if zero_phase is False:
@@ -2010,11 +2002,11 @@ class TestSOSFilt(TestCase):
         # Test the use of zi when sosfilt is applied to axis 1 of a 3-d input.
 
         # Input array is x.
-        np.random.seed(159)
-        x = np.random.randint(0, 5, size=(2, 15, 3))
+        x = np.random.RandomState(159).randint(0, 5, size=(2, 15, 3))
 
-        # Design a filter in SOS format.
-        sos = signal.butter(6, 0.35, output='sos')
+        # Design a filter in ZPK format and convert to SOS
+        zpk = signal.butter(6, 0.35, output='zpk')
+        sos = zpk2sos(*zpk)
         nsections = sos.shape[0]
 
         # Filter along this axis.
@@ -2037,6 +2029,19 @@ class TestSOSFilt(TestCase):
         y = np.concatenate((y1, y2), axis=axis)
         assert_allclose(y, yf, rtol=1e-10, atol=1e-13)
         assert_allclose(z2, zf, rtol=1e-10, atol=1e-13)
+
+        # let's try the "step" initial condition
+        zi = sosfilt_zi(sos)
+        zi.shape = [nsections, 1, 2, 1]
+        zi = zi * x[:, 0:1, :]
+        y = sosfilt(sos, x, axis=axis, zi=zi)[0]
+        # check it against the TF form
+        b, a = zpk2tf(*zpk)
+        zi = lfilter_zi(b, a)
+        zi.shape = [1, zi.size, 1]
+        zi = zi * x[:, 0:1, :]
+        y_tf = lfilter(b, a, x, axis=axis, zi=zi)[0]
+        assert_allclose(y, y_tf, rtol=1e-10, atol=1e-13)
 
     def test_bad_zi_shape(self):
         # The shape of zi is checked before using any values in the

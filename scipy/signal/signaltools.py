@@ -7,8 +7,8 @@ import warnings
 import threading
 import sys
 
-from . import sigtools, lti
-from ._upfirdn import _UpFIRDn, _output_len
+from . import sigtools, dlti
+from ._upfirdn import upfirdn, _UpFIRDn, _output_len
 from scipy._lib.six import callable
 from scipy._lib._version import NumpyVersion
 from scipy import fftpack, linalg
@@ -23,7 +23,7 @@ import numpy as np
 from scipy.special import factorial
 from .windows import get_window
 from ._arraytools import axis_slice, axis_reverse, odd_ext, even_ext, const_ext
-from .filter_design import cheby1
+from .filter_design import cheby1, _validate_sos
 from .fir_filter_design import firwin
 
 if sys.version_info.major >= 3 and sys.version_info.minor >= 5:
@@ -37,7 +37,7 @@ __all__ = ['correlate', 'fftconvolve', 'convolve', 'convolve2d', 'correlate2d',
            'lfiltic', 'sosfilt', 'deconvolve', 'hilbert', 'hilbert2',
            'cmplx_sort', 'unique_roots', 'invres', 'invresz', 'residue',
            'residuez', 'resample', 'resample_poly', 'detrend',
-           'lfilter_zi', 'sosfilt_zi',
+           'lfilter_zi', 'sosfilt_zi', 'sosfiltfilt',
            'filtfilt', 'decimate', 'vectorstrength']
 
 
@@ -243,56 +243,6 @@ def _centered(arr, newshape):
     return arr[tuple(myslice)]
 
 
-def _next_regular(target):
-    """
-    Find the next regular number greater than or equal to target.
-    Regular numbers are composites of the prime factors 2, 3, and 5.
-    Also known as 5-smooth numbers or Hamming numbers, these are the optimal
-    size for inputs to FFTPACK.
-
-    Target must be a positive integer.
-    """
-    if target <= 6:
-        return target
-
-    # Quickly check if it's already a power of 2
-    if not (target & (target-1)):
-        return target
-
-    match = float('inf')  # Anything found will be smaller
-    p5 = 1
-    while p5 < target:
-        p35 = p5
-        while p35 < target:
-            # Ceiling integer division, avoiding conversion to float
-            # (quotient = ceil(target / p35))
-            quotient = -(-target // p35)
-
-            # Quickly find next power of 2 >= quotient
-            try:
-                p2 = 2**((quotient - 1).bit_length())
-            except AttributeError:
-                # Fallback for Python <2.7
-                p2 = 2**(len(bin(quotient - 1)) - 2)
-
-            N = p2 * p35
-            if N == target:
-                return N
-            elif N < match:
-                match = N
-            p35 *= 3
-            if p35 == target:
-                return p35
-        if p35 < match:
-            match = p35
-        p5 *= 5
-        if p5 == target:
-            return p5
-    if p5 < match:
-        match = p5
-    return match
-
-
 def fftconvolve(in1, in2, mode="full"):
     """Convolve two N-dimensional arrays using FFT.
 
@@ -394,7 +344,7 @@ def fftconvolve(in1, in2, mode="full"):
         in1, s1, in2, s2 = in2, s2, in1, s1
 
     # Speed up FFT by padding to optimal size for FFTPACK
-    fshape = [_next_regular(int(d)) for d in shape]
+    fshape = [fftpack.helper.next_fast_len(int(d)) for d in shape]
     fslice = tuple([slice(0, int(sz)) for sz in shape])
     # Pre-1.9 NumPy FFT routines are not threadsafe.  For older NumPys, make
     # sure we only call rfftn/irfftn from one thread at a time.
@@ -930,7 +880,7 @@ def lfilter(b, a, x, axis=-1, zi=None):
     zi : array_like, optional
         Initial conditions for the filter delays.  It is a vector
         (or array of vectors for an N-dimensional input) of length
-        ``max(len(a),len(b))-1``.  If `zi` is None or is not given then
+        ``max(len(a), len(b)) - 1``.  If `zi` is None or is not given then
         initial rest is assumed.  See `lfiltic` for more information.
 
     Returns
@@ -949,34 +899,37 @@ def lfilter(b, a, x, axis=-1, zi=None):
     filtfilt : A forward-backward filter, to obtain a filter with linear phase.
     savgol_filter : A Savitzky-Golay filter.
     sosfilt: Filter data using cascaded second-order sections.
+    sosfiltfilt: A forward-backward filter using second-order sections.
 
     Notes
     -----
     The filter function is implemented as a direct II transposed structure.
     This means that the filter implements::
 
-       a[0]*y[n] = b[0]*x[n] + b[1]*x[n-1] + ... + b[nb]*x[n-nb]
-                               - a[1]*y[n-1] - ... - a[na]*y[n-na]
+       a[0]*y[n] = b[0]*x[n] + b[1]*x[n-1] + ... + b[M]*x[n-M]
+                             - a[1]*y[n-1] - ... - a[N]*y[n-N]
 
-    using the following difference equations::
+    where `M` is the degree of the numerator, `N` is the degree of the
+    denominator, and `n` is the sample number.  It is implemented using
+    the following difference equations (assuming M = N)::
 
-         y[m] = b[0]*x[m] + z[0,m-1]
-         z[0,m] = b[1]*x[m] + z[1,m-1] - a[1]*y[m]
+         a[0]*y[n] = b[0] * x[n]               + d[0][n-1]
+           d[0][n] = b[1] * x[n] - a[1] * y[n] + d[1][n-1]
+           d[1][n] = b[2] * x[n] - a[2] * y[n] + d[2][n-1]
          ...
-         z[n-3,m] = b[n-2]*x[m] + z[n-2,m-1] - a[n-2]*y[m]
-         z[n-2,m] = b[n-1]*x[m] - a[n-1]*y[m]
+         d[N-2][n] = b[N-1]*x[n] - a[N-1]*y[n] + d[N-1][n-1]
+         d[N-1][n] = b[N] * x[n] - a[N] * y[n]
 
-    where m is the output sample number and n=max(len(a),len(b)) is the
-    model order.
+    where `d` are the state variables.
 
     The rational transfer function describing this filter in the
     z-transform domain is::
 
-                             -1               -nb
-                 b[0] + b[1]z  + ... + b[nb] z
-         Y(z) = ---------------------------------- X(z)
-                             -1               -na
-                 a[0] + a[1]z  + ... + a[na] z
+                             -1              -M
+                 b[0] + b[1]z  + ... + b[M] z
+         Y(z) = -------------------------------- X(z)
+                             -1              -N
+                 a[0] + a[1]z  + ... + a[N] z
 
     Examples
     --------
@@ -1105,13 +1058,13 @@ def lfiltic(b, a, y, x=None):
     y : array_like
         Initial conditions.
 
-        If ``N=len(a) - 1``, then ``y = {y[-1], y[-2], ..., y[-N]}``.
+        If ``N = len(a) - 1``, then ``y = {y[-1], y[-2], ..., y[-N]}``.
 
         If `y` is too short, it is padded with zeros.
     x : array_like, optional
         Initial conditions.
 
-        If ``M=len(b) - 1``, then ``x = {x[-1], x[-2], ..., x[-M]}``.
+        If ``M = len(b) - 1``, then ``x = {x[-1], x[-2], ..., x[-M]}``.
 
         If `x` is not given, its initial conditions are assumed zero.
 
@@ -1120,8 +1073,8 @@ def lfiltic(b, a, y, x=None):
     Returns
     -------
     zi : ndarray
-        The state vector ``zi``.
-        ``zi = {z_0[-1], z_1[-1], ..., z_K-1[-1]}``, where ``K = max(M,N)``.
+        The state vector ``zi = {z_0[-1], z_1[-1], ..., z_K-1[-1]}``,
+        where ``K = max(M, N)``.
 
     See Also
     --------
@@ -1485,30 +1438,37 @@ def invres(r, p, k, tol=1e-3, rtype='avg'):
     """
     Compute b(s) and a(s) from partial fraction expansion.
 
-    If ``M = len(b)`` and ``N = len(a)``::
+    If `M` is the degree of numerator `b` and `N` the degree of denominator
+    `a`::
 
-                b(s)     b[0] x**(M-1) + b[1] x**(M-2) + ... + b[M-1]
-        H(s) = ------ = ----------------------------------------------
-                a(s)     a[0] x**(N-1) + a[1] x**(N-2) + ... + a[N-1]
+              b(s)     b[0] s**(M) + b[1] s**(M-1) + ... + b[M]
+      H(s) = ------ = ------------------------------------------
+              a(s)     a[0] s**(N) + a[1] s**(N-1) + ... + a[N]
 
-                 r[0]       r[1]             r[-1]
-             = -------- + -------- + ... + --------- + k(s)
-               (s-p[0])   (s-p[1])         (s-p[-1])
+    then the partial-fraction expansion H(s) is defined as::
 
-    If there are any repeated roots (closer than tol), then the partial
-    fraction expansion has terms like::
+               r[0]       r[1]             r[-1]
+           = -------- + -------- + ... + --------- + k(s)
+             (s-p[0])   (s-p[1])         (s-p[-1])
+
+    If there are any repeated roots (closer together than `tol`), then H(s)
+    has terms like::
 
           r[i]      r[i+1]              r[i+n-1]
         -------- + ----------- + ... + -----------
         (s-p[i])  (s-p[i])**2          (s-p[i])**n
 
+    This function is used for polynomials in positive powers of s or z,
+    such as analog filters or digital filters in controls engineering.  For
+    negative powers of z (typical for digital filters in DSP), use `invresz`.
+
     Parameters
     ----------
-    r : ndarray
+    r : array_like
         Residues.
-    p : ndarray
+    p : array_like
         Poles.
-    k : ndarray
+    k : array_like
         Coefficients of the direct polynomial term.
     tol : float, optional
         The tolerance for two roots to be considered equal. Default is 1e-3.
@@ -1516,15 +1476,20 @@ def invres(r, p, k, tol=1e-3, rtype='avg'):
         How to determine the returned root if multiple roots are within
         `tol` of each other.
 
-          'max': pick the maximum of those roots.
+          - 'max': pick the maximum of those roots.
+          - 'min': pick the minimum of those roots.
+          - 'avg': take the average of those roots.
 
-          'min': pick the minimum of those roots.
-
-          'avg': take the average of those roots.
+    Returns
+    -------
+    b : ndarray
+        Numerator polynomial coefficients.
+    a : ndarray
+        Denominator polynomial coefficients.
 
     See Also
     --------
-    residue, unique_roots
+    residue, invresz, unique_roots
 
     """
     extra = k
@@ -1560,12 +1525,14 @@ def residue(b, a, tol=1e-3, rtype='avg'):
     """
     Compute partial-fraction expansion of b(s) / a(s).
 
-    If ``M = len(b)`` and ``N = len(a)``, then the partial-fraction
-    expansion H(s) is defined as::
+    If `M` is the degree of numerator `b` and `N` the degree of denominator
+    `a`::
 
-              b(s)     b[0] s**(M-1) + b[1] s**(M-2) + ... + b[M-1]
-      H(s) = ------ = ----------------------------------------------
-              a(s)     a[0] s**(N-1) + a[1] s**(N-2) + ... + a[N-1]
+              b(s)     b[0] s**(M) + b[1] s**(M-1) + ... + b[M]
+      H(s) = ------ = ------------------------------------------
+              a(s)     a[0] s**(N) + a[1] s**(N-1) + ... + a[N]
+
+    then the partial-fraction expansion H(s) is defined as::
 
                r[0]       r[1]             r[-1]
            = -------- + -------- + ... + --------- + k(s)
@@ -1574,9 +1541,20 @@ def residue(b, a, tol=1e-3, rtype='avg'):
     If there are any repeated roots (closer together than `tol`), then H(s)
     has terms like::
 
-            r[i]      r[i+1]              r[i+n-1]
-          -------- + ----------- + ... + -----------
-          (s-p[i])  (s-p[i])**2          (s-p[i])**n
+          r[i]      r[i+1]              r[i+n-1]
+        -------- + ----------- + ... + -----------
+        (s-p[i])  (s-p[i])**2          (s-p[i])**n
+
+    This function is used for polynomials in positive powers of s or z,
+    such as analog filters or digital filters in controls engineering.  For
+    negative powers of z (typical for digital filters in DSP), use `residuez`.
+
+    Parameters
+    ----------
+    b : array_like
+        Numerator polynomial coefficients.
+    a : array_like
+        Denominator polynomial coefficients.
 
     Returns
     -------
@@ -1589,7 +1567,7 @@ def residue(b, a, tol=1e-3, rtype='avg'):
 
     See Also
     --------
-    invres, numpy.poly, unique_roots
+    invres, residuez, numpy.poly, unique_roots
 
     """
 
@@ -1632,26 +1610,48 @@ def residuez(b, a, tol=1e-3, rtype='avg'):
     """
     Compute partial-fraction expansion of b(z) / a(z).
 
-    If ``M = len(b)`` and ``N = len(a)``::
+    If `M` is the degree of numerator `b` and `N` the degree of denominator
+    `a`::
 
-                b(z)     b[0] + b[1] z**(-1) + ... + b[M-1] z**(-M+1)
-        H(z) = ------ = ----------------------------------------------
-                a(z)     a[0] + a[1] z**(-1) + ... + a[N-1] z**(-N+1)
+                b(z)     b[0] + b[1] z**(-1) + ... + b[M] z**(-M)
+        H(z) = ------ = ------------------------------------------
+                a(z)     a[0] + a[1] z**(-1) + ... + a[N] z**(-N)
+
+    then the partial-fraction expansion H(z) is defined as::
 
                  r[0]                   r[-1]
          = --------------- + ... + ---------------- + k[0] + k[1]z**(-1) ...
            (1-p[0]z**(-1))         (1-p[-1]z**(-1))
 
-    If there are any repeated roots (closer than tol), then the partial
+    If there are any repeated roots (closer than `tol`), then the partial
     fraction expansion has terms like::
 
              r[i]              r[i+1]                    r[i+n-1]
         -------------- + ------------------ + ... + ------------------
         (1-p[i]z**(-1))  (1-p[i]z**(-1))**2         (1-p[i]z**(-1))**n
 
+    This function is used for polynomials in negative powers of z,
+    such as digital filters in DSP.  For positive powers, use `residue`.
+
+    Parameters
+    ----------
+    b : array_like
+        Numerator polynomial coefficients.
+    a : array_like
+        Denominator polynomial coefficients.
+
+    Returns
+    -------
+    r : ndarray
+        Residues.
+    p : ndarray
+        Poles.
+    k : ndarray
+        Coefficients of the direct polynomial term.
+
     See also
     --------
-    invresz, unique_roots
+    invresz, residue, unique_roots
 
     """
     b, a = map(asarray, (b, a))
@@ -1703,22 +1703,53 @@ def invresz(r, p, k, tol=1e-3, rtype='avg'):
     """
     Compute b(z) and a(z) from partial fraction expansion.
 
-    If ``M = len(b)`` and ``N = len(a)``::
+    If `M` is the degree of numerator `b` and `N` the degree of denominator
+    `a`::
 
-                b(z)     b[0] + b[1] z**(-1) + ... + b[M-1] z**(-M+1)
-        H(z) = ------ = ----------------------------------------------
-                a(z)     a[0] + a[1] z**(-1) + ... + a[N-1] z**(-N+1)
+                b(z)     b[0] + b[1] z**(-1) + ... + b[M] z**(-M)
+        H(z) = ------ = ------------------------------------------
+                a(z)     a[0] + a[1] z**(-1) + ... + a[N] z**(-N)
 
-                     r[0]                   r[-1]
-             = --------------- + ... + ---------------- + k[0] + k[1]z**(-1)...
-               (1-p[0]z**(-1))         (1-p[-1]z**(-1))
+    then the partial-fraction expansion H(z) is defined as::
 
-    If there are any repeated roots (closer than tol), then the partial
+                 r[0]                   r[-1]
+         = --------------- + ... + ---------------- + k[0] + k[1]z**(-1) ...
+           (1-p[0]z**(-1))         (1-p[-1]z**(-1))
+
+    If there are any repeated roots (closer than `tol`), then the partial
     fraction expansion has terms like::
 
              r[i]              r[i+1]                    r[i+n-1]
         -------------- + ------------------ + ... + ------------------
         (1-p[i]z**(-1))  (1-p[i]z**(-1))**2         (1-p[i]z**(-1))**n
+
+    This function is used for polynomials in negative powers of z,
+    such as digital filters in DSP.  For positive powers, use `invres`.
+
+    Parameters
+    ----------
+    r : array_like
+        Residues.
+    p : array_like
+        Poles.
+    k : array_like
+        Coefficients of the direct polynomial term.
+    tol : float, optional
+        The tolerance for two roots to be considered equal. Default is 1e-3.
+    rtype : {'max', 'min, 'avg'}, optional
+        How to determine the returned root if multiple roots are within
+        `tol` of each other.
+
+          - 'max': pick the maximum of those roots.
+          - 'min': pick the minimum of those roots.
+          - 'avg': take the average of those roots.
+
+    Returns
+    -------
+    b : ndarray
+        Numerator polynomial coefficients.
+    a : ndarray
+        Denominator polynomial coefficients.
 
     See Also
     --------
@@ -1786,8 +1817,8 @@ def resample(x, num, t=None, axis=0, window=None):
 
     See also
     --------
-    decimate
-    resample_poly
+    decimate : Downsample the signal after applying an FIR or IIR filter.
+    resample_poly : Resample using polyphase filtering and an FIR filter.
 
     Notes
     -----
@@ -1891,11 +1922,10 @@ def resample_poly(x, up, down, axis=0, window=('kaiser', 5.0)):
     down : int
         The downsampling factor.
     axis : int, optional
-        The axis of `x` that is resampled.  Default is 0.
-    window : string or tuple of string and parameter values
-        Desired window to use to design the low-pass filter. See
-        `scipy.signal.get_window` for a list of windows and required
-        parameters.
+        The axis of `x` that is resampled. Default is 0.
+    window : string, tuple, or array_like, optional
+        Desired window to use to design the low-pass filter, or the FIR filter
+        coefficients to employ. See below for details.
 
     Returns
     -------
@@ -1904,8 +1934,8 @@ def resample_poly(x, up, down, axis=0, window=('kaiser', 5.0)):
 
     See also
     --------
-    decimate
-    resample
+    decimate : Downsample the signal after applying an FIR or IIR filter.
+    resample : Resample up or down using the FFT method.
 
     Notes
     -----
@@ -1917,11 +1947,22 @@ def resample_poly(x, up, down, axis=0, window=('kaiser', 5.0)):
     the number of operations during polyphase filtering will depend on
     the filter length and `down` (see `scipy.signal.upfirdn` for details).
 
-    The `window` argument is passed directly to `scipy.signal.firwin`
-    to design a low-pass filter.
+    The argument `window` specifies the FIR low-pass filter design.
+
+    If `window` is an array_like it is assumed to be the FIR filter
+    coefficients. Note that the FIR filter is applied after the upsampling
+    step, so it should be designed to operate on a signal at a sampling
+    frequency higher than the original by a factor of `up//gcd(up, down)`.
+    This function's output will be centered with respect to this array, so it
+    is best to pass a symmetric filter with an odd number of samples if, as
+    is usually the case, a zero-phase filter is desired.
+
+    For any other type of `window`, the functions `scipy.signal.get_window`
+    and `scipy.signal.firwin` are called to generate the appropriate filter
+    coefficients.
 
     The first sample of the returned vector is the same as the first
-    sample of the input vector.  The spacing between samples is changed
+    sample of the input vector. The spacing between samples is changed
     from ``dx`` to ``dx * up / float(down)``.
 
     Examples
@@ -1959,13 +2000,21 @@ def resample_poly(x, up, down, axis=0, window=('kaiser', 5.0)):
     down //= g_
     if up == down == 1:
         return x.copy()
-    n_out = (x.shape[axis] * up) // down
+    n_out = x.shape[axis] * up
+    n_out = n_out // down + bool(n_out % down)
 
-    # Design a linear-phase low-pass FIR filter
-    max_rate = max(up, down)
-    f_c = 1. / max_rate  # cutoff of FIR filter (rel. to Nyquist)
-    half_len = 10 * max_rate  # reasonable cutoff for our sinc-like function
-    h = firwin(2 * half_len + 1, f_c, window=window)
+    if isinstance(window, (list, np.ndarray)):
+        window = asarray(window)
+        if window.ndim > 1:
+            raise ValueError('window must be 1-D')
+        half_len = (window.size - 1) // 2
+        h = window
+    else:
+        # Design a linear-phase low-pass FIR filter
+        max_rate = max(up, down)
+        f_c = 1. / max_rate  # cutoff of FIR filter (rel. to Nyquist)
+        half_len = 10 * max_rate  # reasonable cutoff for our sinc-like function
+        h = firwin(2 * half_len + 1, f_c, window=window)
     h *= up
 
     # Zero-pad our filter to put the output samples at the center
@@ -2591,12 +2640,11 @@ def filtfilt(b, a, x, axis=-1, padtype='odd', padlen=None, method='pad',
     Returns
     -------
     y : ndarray
-        The filtered output, an array of type numpy.float64 with the same
-        shape as `x`.
+        The filtered output with the same shape as `x`.
 
     See Also
     --------
-    lfilter_zi, lfilter, lfiltic, savgol_filter, sosfilt
+    sosfiltfilt, lfilter_zi, lfilter, lfiltic, savgol_filter, sosfilt
 
     Notes
     -----
@@ -2695,10 +2743,41 @@ def filtfilt(b, a, x, axis=-1, padtype='odd', padlen=None, method='pad',
         y, z1, z2 = _filtfilt_gust(b, a, x, axis=axis, irlen=irlen)
         return y
 
-    # `method` is "pad"...
+    # method == "pad"
+    edge, ext = _validate_pad(padtype, padlen, x, axis,
+                              ntaps=max(len(a), len(b)))
 
-    ntaps = max(len(a), len(b))
+    # Get the steady state of the filter's step response.
+    zi = lfilter_zi(b, a)
 
+    # Reshape zi and create x0 so that zi*x0 broadcasts
+    # to the correct value for the 'zi' keyword argument
+    # to lfilter.
+    zi_shape = [1] * x.ndim
+    zi_shape[axis] = zi.size
+    zi = np.reshape(zi, zi_shape)
+    x0 = axis_slice(ext, stop=1, axis=axis)
+
+    # Forward filter.
+    (y, zf) = lfilter(b, a, ext, axis=axis, zi=zi * x0)
+
+    # Backward filter.
+    # Create y0 so zi*y0 broadcasts appropriately.
+    y0 = axis_slice(y, start=-1, axis=axis)
+    (y, zf) = lfilter(b, a, axis_reverse(y, axis=axis), axis=axis, zi=zi * y0)
+
+    # Reverse y.
+    y = axis_reverse(y, axis=axis)
+
+    if edge > 0:
+        # Slice the actual signal from the extended signal.
+        y = axis_slice(y, start=edge, stop=-edge, axis=axis)
+
+    return y
+
+
+def _validate_pad(padtype, padlen, x, axis, ntaps):
+    """Helper to validate padding for filtfilt"""
     if padtype not in ['even', 'odd', 'constant', None]:
         raise ValueError(("Unknown value '%s' given to padtype.  padtype "
                           "must be 'even', 'odd', 'constant', or None.") %
@@ -2729,34 +2808,7 @@ def filtfilt(b, a, x, axis=-1, padtype='odd', padlen=None, method='pad',
             ext = const_ext(x, edge, axis=axis)
     else:
         ext = x
-
-    # Get the steady state of the filter's step response.
-    zi = lfilter_zi(b, a)
-
-    # Reshape zi and create x0 so that zi*x0 broadcasts
-    # to the correct value for the 'zi' keyword argument
-    # to lfilter.
-    zi_shape = [1] * x.ndim
-    zi_shape[axis] = zi.size
-    zi = np.reshape(zi, zi_shape)
-    x0 = axis_slice(ext, stop=1, axis=axis)
-
-    # Forward filter.
-    (y, zf) = lfilter(b, a, ext, axis=axis, zi=zi * x0)
-
-    # Backward filter.
-    # Create y0 so zi*y0 broadcasts appropriately.
-    y0 = axis_slice(y, start=-1, axis=axis)
-    (y, zf) = lfilter(b, a, axis_reverse(y, axis=axis), axis=axis, zi=zi * y0)
-
-    # Reverse y.
-    y = axis_reverse(y, axis=axis)
-
-    if edge > 0:
-        # Slice the actual signal from the extended signal.
-        y = axis_slice(y, start=edge, stop=-edge, axis=axis)
-
-    return y
+    return edge, ext
 
 
 def sosfilt(sos, x, axis=-1, zi=None):
@@ -2800,7 +2852,7 @@ def sosfilt(sos, x, axis=-1, zi=None):
 
     See Also
     --------
-    zpk2sos, sos2zpk, sosfilt_zi
+    zpk2sos, sos2zpk, sosfilt_zi, sosfiltfilt, sosfreqz
 
     Notes
     -----
@@ -2832,15 +2884,7 @@ def sosfilt(sos, x, axis=-1, zi=None):
 
     """
     x = np.asarray(x)
-
-    sos = atleast_2d(sos)
-    if sos.ndim != 2:
-        raise ValueError('sos array must be 2D')
-
-    n_sections, m = sos.shape
-    if m != 6:
-        raise ValueError('sos array must be shape (n_sections, 6)')
-
+    sos, n_sections = _validate_sos(sos)
     use_zi = zi is not None
     if use_zi:
         zi = np.asarray(zi)
@@ -2848,10 +2892,10 @@ def sosfilt(sos, x, axis=-1, zi=None):
         x_zi_shape[axis] = 2
         x_zi_shape = tuple([n_sections] + x_zi_shape)
         if zi.shape != x_zi_shape:
-            raise ValueError('Invalid zi shape.  With axis=%r, an input with '
+            raise ValueError('Invalid zi shape. With axis=%r, an input with '
                              'shape %r, and an sos array with %d sections, zi '
-                             'must have shape %r.' %
-                             (axis, x.shape, n_sections, x_zi_shape))
+                             'must have shape %r, got %r.' %
+                             (axis, x.shape, n_sections, x_zi_shape, zi.shape))
         zf = zeros_like(zi)
 
     for section in range(n_sections):
@@ -2864,12 +2908,86 @@ def sosfilt(sos, x, axis=-1, zi=None):
     return out
 
 
+def sosfiltfilt(sos, x, axis=-1, padtype='odd', padlen=None):
+    """
+    A forward-backward filter using cascaded second-order sections.
+
+    See `filtfilt` for more complete information about this method.
+
+    Parameters
+    ----------
+    sos : array_like
+        Array of second-order filter coefficients, must have shape
+        ``(n_sections, 6)``. Each row corresponds to a second-order
+        section, with the first three columns providing the numerator
+        coefficients and the last three providing the denominator
+        coefficients.
+    x : array_like
+        The array of data to be filtered.
+    axis : int, optional
+        The axis of `x` to which the filter is applied.
+        Default is -1.
+    padtype : str or None, optional
+        Must be 'odd', 'even', 'constant', or None.  This determines the
+        type of extension to use for the padded signal to which the filter
+        is applied.  If `padtype` is None, no padding is used.  The default
+        is 'odd'.
+    padlen : int or None, optional
+        The number of elements by which to extend `x` at both ends of
+        `axis` before applying the filter.  This value must be less than
+        ``x.shape[axis] - 1``.  ``padlen=0`` implies no padding.
+        The default value is::
+
+            3 * (2 * len(sos) + 1 - min((sos[:, 2] == 0).sum(),
+                                        (sos[:, 5] == 0).sum()))
+
+        The extra subtraction at the end attempts to compensate for poles
+        and zeros at the origin (e.g. for odd-order filters) to yield
+        equivalent estimates of `padlen` to those of `filtfilt` for
+        second-order section filters built with `scipy.signal` functions.
+
+    Returns
+    -------
+    y : ndarray
+        The filtered output with the same shape as `x`.
+
+    See Also
+    --------
+    filtfilt, sosfilt, sosfilt_zi, sosfreqz
+
+    Notes
+    -----
+    .. versionadded:: 0.18.0
+    """
+    sos, n_sections = _validate_sos(sos)
+
+    # `method` is "pad"...
+    ntaps = 2 * n_sections + 1
+    ntaps -= min((sos[:, 2] == 0).sum(), (sos[:, 5] == 0).sum())
+    edge, ext = _validate_pad(padtype, padlen, x, axis,
+                              ntaps=ntaps)
+
+    # These steps follow the same form as filtfilt with modifications
+    zi = sosfilt_zi(sos)  # shape (n_sections, 2) --> (n_sections, ..., 2, ...)
+    zi_shape = [1] * x.ndim
+    zi_shape[axis] = 2
+    zi.shape = [n_sections] + zi_shape
+    x_0 = axis_slice(ext, stop=1, axis=axis)
+    (y, zf) = sosfilt(sos, ext, axis=axis, zi=zi * x_0)
+    y_0 = axis_slice(y, start=-1, axis=axis)
+    (y, zf) = sosfilt(sos, axis_reverse(y, axis=axis), axis=axis, zi=zi * y_0)
+    y = axis_reverse(y, axis=axis)
+    if edge > 0:
+        y = axis_slice(y, start=edge, stop=-edge, axis=axis)
+    return y
+
+
 def decimate(x, q, n=None, ftype='iir', axis=-1, zero_phase=None):
     """
-    Downsample the signal by using a filter.
+    Downsample the signal after applying an anti-aliasing filter.
 
-    By default, an order 8 Chebyshev type I filter is used.  A 30 point FIR
-    filter with hamming window is used if `ftype` is 'fir'.
+    By default, an order 8 Chebyshev type I filter is used. A 30 point FIR
+    filter with Hamming window is used if `ftype` is 'fir'.
 
     Parameters
     ----------
@@ -2881,16 +2999,19 @@ def decimate(x, q, n=None, ftype='iir', axis=-1, zero_phase=None):
     n : int, optional
         The order of the filter (1 less than the length for 'fir'). Defaults to
         8 for 'iir' and 30 for 'fir'.
-    ftype : str {'iir', 'fir'} or ``lti`` instance, optional
+    ftype : str {'iir', 'fir'} or ``dlti`` instance, optional
         If 'iir' or 'fir', specifies the type of lowpass filter. If an instance
-        of an `lti` object, uses that object to filter before downsampling.
+        of an `dlti` object, uses that object to filter before downsampling.
     axis : int, optional
         The axis along which to decimate.
     zero_phase : bool, optional
         Prevent phase shift by filtering with `filtfilt` instead of `lfilter`
-        when `ftype` is not 'fir'.  A value of `True` is recommended, since a
-        phase shift is generally not desired. Using `None` defaults to `False`
-        for backwards compatibility.
+        when using an IIR filter, and shifting the outputs back by the filter's
+        group delay when using an FIR filter. A value of ``True`` is
+        recommended, since a phase shift is generally not desired. Using
+        ``None`` defaults to ``False`` for backwards compatibility. This
+        default will change to ``True`` in a future release, so it is best to
+        set this argument explicitly.
 
         .. versionadded:: 0.18.0
 
@@ -2901,13 +3022,13 @@ def decimate(x, q, n=None, ftype='iir', axis=-1, zero_phase=None):
 
     See Also
     --------
-    resample
-    resample_poly
+    resample : Resample up or down using the FFT method.
+    resample_poly : Resample using polyphase filtering and an FIR filter.
 
     Notes
     -----
     The ``zero_phase`` keyword was added in 0.18.0.
-    The possibility to use instances of ``lti`` as ``ftype`` was added in
+    The possibility to use instances of ``dlti`` as ``ftype`` was added in
     0.18.0.
     """
 
@@ -2920,35 +3041,42 @@ def decimate(x, q, n=None, ftype='iir', axis=-1, zero_phase=None):
     if ftype == 'fir':
         if n is None:
             n = 30
-        system = lti(firwin(n + 1, 1. / q, window='hamming'), 1.)
-
+        system = dlti(firwin(n+1, 1. / q, window='hamming'), 1.)
     elif ftype == 'iir':
         if n is None:
             n = 8
-        system = lti(*cheby1(n, 0.05, 0.8 / q))
-    elif isinstance(ftype, lti):
-        system = ftype
+        system = dlti(*cheby1(n, 0.05, 0.8 / q))
+    elif isinstance(ftype, dlti):
+        system = ftype._as_tf()  # Avoids copying if already in TF form
+        n = np.max((system.num.size, system.den.size)) - 1
     else:
         raise ValueError('invalid ftype')
 
     if zero_phase is None:
         warnings.warn(" Note: Decimate's zero_phase keyword argument will "
-                      "default to True in a future release.  Until then, "
-                      "decimate defaults to 'one-way filtering for backwards "
+                      "default to True in a future release. Until then, "
+                      "decimate defaults to one-way filtering for backwards "
                       "compatibility. Ideally, always set this argument "
                       "explicitly.", FutureWarning)
         zero_phase = False
 
-    if zero_phase and ftype == 'fir':
-        warnings.warn('zero_phase is not implemented for FIR downsampling, '
-                      'using zero_phase=False.')
-        zero_phase = False
+    sl = [slice(None)] * x.ndim
 
-    if zero_phase:
-        y = filtfilt(system.num, system.den, x, axis=axis)
-    else:
-        y = lfilter(system.num, system.den, x, axis=axis)
+    if len(system.den) == 1:  # FIR case
+        if zero_phase:
+            y = resample_poly(x, 1, q, axis=axis, window=system.num)
+        else:
+            # upfirdn is generally faster than lfilter by a factor equal to the
+            # downsampling factor, since it only calculates the needed outputs
+            n_out = x.shape[axis] // q + bool(x.shape[axis] % q)
+            y = upfirdn(system.num, x, up=1, down=q, axis=axis)
+            sl[axis] = slice(None, n_out, None)
 
-    sl = [slice(None)] * y.ndim
-    sl[axis] = slice(None, None, q)
+    else:  # IIR case
+        if zero_phase:
+            y = filtfilt(system.num, system.den, x, axis=axis)
+        else:
+            y = lfilter(system.num, system.den, x, axis=axis)
+        sl[axis] = slice(None, None, q)
+
     return y[sl]
